@@ -1,0 +1,527 @@
+/**
+ * ============================================================
+ *  auth.js — Moteur d'authentification avec Supabase
+ *  Stockage : Supabase (base de données en ligne)
+ *  Fallback session : localStorage uniquement pour la session active
+ * ============================================================
+ */
+
+// ── Configuration Supabase ────────────────────────────────────
+const SUPABASE_URL = 'https://mdgofogpghlwesaduxrq.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1kZ29mb2dwZ2hsd2VzYWR1eHJxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE4NjIwNjksImV4cCI6MjA5NzQzODA2OX0.DpBoUIZbxzKjOOWw4r-7Vhtupva_fIg5cEhcKgb19ic';
+
+// Client Supabase léger (fetch direct, pas de lib externe requise)
+const sb = {
+  async query(table, method = 'GET', body = null, params = '') {
+    const url = `${SUPABASE_URL}/rest/v1/${table}${params}`;
+    const opts = {
+      method,
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': method === 'POST' ? 'return=representation' : 'return=representation'
+      }
+    };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(url, opts);
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(err);
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : [];
+  },
+
+  async select(table, params = '') {
+    return this.query(table, 'GET', null, params);
+  },
+
+  async insert(table, data) {
+    return this.query(table, 'POST', data, '');
+  },
+
+  async update(table, data, params) {
+    return this.query(table, 'PATCH', data, params);
+  },
+
+  async upsert(table, data, onConflict = '') {
+    const prefer = onConflict ? `resolution=merge-duplicates` : 'return=representation';
+    const url = `${SUPABASE_URL}/rest/v1/${table}${onConflict ? `?on_conflict=${onConflict}` : ''}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': prefer
+      },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(err);
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : [];
+  },
+
+  async delete(table, params) {
+    return this.query(table, 'DELETE', null, params);
+  }
+};
+
+// ── Session locale (juste pour savoir qui est connecté) ──────
+const SESSION_KEY = 'quran_session';
+
+function _getSession() {
+  try { return JSON.parse(localStorage.getItem(SESSION_KEY)) || null; } catch { return null; }
+}
+function _setSession(data) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+}
+function _clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
+
+// ── Génération username ────────────────────────────────────────
+function makeUsername(prenom, nom) {
+  return (prenom.trim() + '.' + nom.trim()).toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '_');
+}
+function makeProfUsername(prenom, classe) {
+  return (prenom.trim() + '_' + classe.trim()).toLowerCase().replace(/\s+/g, '');
+}
+
+// ─────────────────────────────────────────────────────────────
+//  COMPTES ÉLÈVES
+// ─────────────────────────────────────────────────────────────
+
+async function register(prenom, nom, password, skipSession = false) {
+  prenom = prenom.trim(); nom = nom.trim(); password = password.trim();
+  if (!prenom || !nom || !password) return { ok: false, error: 'يرجى ملء جميع الحقول' };
+  if (password.length < 4) return { ok: false, error: 'كلمة المرور يجب أن تكون 4 أحرف على الأقل' };
+
+  const username = makeUsername(prenom, nom);
+
+  try {
+    // Vérifier si l'élève existe déjà
+    const existing = await sb.select('eleves', `?username=eq.${encodeURIComponent(username)}`);
+    if (existing && existing.length > 0) return { ok: false, error: 'هذا الاسم مستخدم بالفعل، جرب اسمًا مختلفًا' };
+
+    await sb.insert('eleves', { username, prenom, nom, password, is_suspended: false });
+
+    if (!skipSession) _setSession({ username, prenom, nom });
+    return { ok: true, username };
+  } catch (e) {
+    console.error('register error:', e);
+    return { ok: false, error: 'خطأ في الاتصال بالخادم: ' + e.message };
+  }
+}
+
+async function login(prenom, nom, password) {
+  prenom = prenom.trim(); nom = nom.trim(); password = password.trim();
+  if (!prenom || !nom || !password) return { ok: false, error: 'يرجى ملء جميع الحقول' };
+
+  const username = makeUsername(prenom, nom);
+
+  try {
+    const rows = await sb.select('eleves', `?username=eq.${encodeURIComponent(username)}`);
+    if (!rows || rows.length === 0) return { ok: false, error: 'لم يتم العثور على هذا الحساب' };
+
+    const user = rows[0];
+
+    // Compatibilité avec anciennes passwords btoa
+    let valid = false;
+    if (user.password === password) valid = true;
+    try { if (atob(user.password) === password) valid = true; } catch(e) {}
+
+    if (!valid) return { ok: false, error: 'كلمة المرور غير صحيحة' };
+    if (user.is_suspended) return { ok: false, error: 'حساب مغلق بسبب عدم أداء الواجب الشهري أو كثرة الغيابات, المرجو الاتصال بالادارة.' };
+
+    _setSession({ username, prenom: user.prenom, nom: user.nom });
+    return { ok: true, username };
+  } catch (e) {
+    console.error('login error:', e);
+    return { ok: false, error: 'خطأ في الاتصال بالخادم: ' + e.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PROFESSEURS
+// ─────────────────────────────────────────────────────────────
+
+async function registerProf(prenom, classe, password) {
+  prenom = prenom.trim(); classe = classe.trim(); password = password.trim();
+  const username = makeProfUsername(prenom, classe);
+
+  try {
+    const existing = await sb.select('profs', `?username=eq.${encodeURIComponent(username)}`);
+    if (existing && existing.length > 0) return { ok: false, error: 'هذا الأستاذ مسجل مسبقاً (Ce professeur existe déjà).' };
+
+    await sb.insert('profs', { username, prenom, classe, password, students: [] });
+    return { ok: true, username };
+  } catch (e) {
+    console.error('registerProf error:', e);
+    return { ok: false, error: 'خطأ في الاتصال بالخادم: ' + e.message };
+  }
+}
+
+async function loginProf(prenom, classe, password) {
+  prenom = prenom.trim(); classe = classe.trim(); password = password.trim();
+  const username = makeProfUsername(prenom, classe);
+
+  try {
+    const rows = await sb.select('profs', `?username=eq.${encodeURIComponent(username)}`);
+    if (!rows || rows.length === 0 || rows[0].password !== password)
+      return { ok: false, error: 'معلومات الأستاذ غير صحيحة.' };
+
+    _setSession({ username, prenom, classe, role: 'prof' });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: 'خطأ في الاتصال: ' + e.message };
+  }
+}
+
+async function getProfs() {
+  try {
+    const rows = await sb.select('profs', '?select=*');
+    // Convertir en objet { username: {...} } pour compatibilité
+    const result = {};
+    rows.forEach(p => { result[p.username] = p; });
+    return result;
+  } catch (e) {
+    console.error('getProfs error:', e);
+    return {};
+  }
+}
+
+async function saveProfs(profsData) {
+  // profsData est un objet { username: {...} }
+  try {
+    for (const [username, prof] of Object.entries(profsData)) {
+      await sb.upsert('profs', { ...prof, username }, 'username');
+    }
+  } catch (e) {
+    console.error('saveProfs error:', e);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SESSION
+// ─────────────────────────────────────────────────────────────
+
+function logout() { _clearSession(); }
+function getSession() { return _getSession(); }
+function requireAuth(redirectTo = 'login.html') {
+  if (!getSession()) { window.location.href = redirectTo; return false; }
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ÉLÈVES (POUR ADMIN)
+// ─────────────────────────────────────────────────────────────
+
+async function getAllStudents() {
+  try {
+    const rows = await sb.select('eleves', '?select=*');
+    return rows.map(u => ({
+      username: u.username,
+      prenom: u.prenom,
+      nom: u.nom,
+      createdAt: u.created_at,
+      isSuspended: u.is_suspended || false,
+      progress: {}
+    }));
+  } catch (e) {
+    console.error('getAllStudents error:', e);
+    return [];
+  }
+}
+
+async function getAllUsers() {
+  try {
+    const rows = await sb.select('eleves', '?select=*');
+    const result = {};
+    rows.forEach(u => { result[u.username] = u; });
+    return result;
+  } catch (e) { return {}; }
+}
+
+async function deleteStudent(username) {
+  try {
+    await sb.delete('eleves', `?username=eq.${encodeURIComponent(username)}`);
+  } catch (e) { console.error('deleteStudent error:', e); }
+}
+
+async function toggleSuspension(username) {
+  try {
+    const rows = await sb.select('eleves', `?username=eq.${encodeURIComponent(username)}`);
+    if (!rows || rows.length === 0) return;
+    const current = rows[0].is_suspended || false;
+    await sb.update('eleves', { is_suspended: !current }, `?username=eq.${encodeURIComponent(username)}`);
+  } catch (e) { console.error('toggleSuspension error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PROGRESSION
+// ─────────────────────────────────────────────────────────────
+
+async function recordActivity(surahId, activityKey, score) {
+  const session = getSession();
+  if (!session) return;
+
+  try {
+    const rows = await sb.select('progressions', `?username=eq.${encodeURIComponent(session.username)}&surah_id=eq.${encodeURIComponent(surahId)}`);
+    let activities = {};
+    if (rows && rows.length > 0) activities = rows[0].activities || {};
+
+    const prev = activities[activityKey];
+    if (!prev || score > prev.score) {
+      activities[activityKey] = { score, date: new Date().toISOString() };
+    }
+
+    await sb.upsert('progressions', {
+      username: session.username,
+      surah_id: surahId,
+      activities
+    }, 'username,surah_id');
+  } catch (e) { console.error('recordActivity error:', e); }
+}
+
+async function completeSurah(surahId) {
+  const session = getSession();
+  if (!session) return;
+
+  try {
+    const rows = await sb.select('progressions', `?username=eq.${encodeURIComponent(session.username)}&surah_id=eq.${encodeURIComponent(surahId)}`);
+    let activities = {};
+    if (rows && rows.length > 0) activities = rows[0].activities || {};
+
+    const scores = Object.values(activities).map(a => a.score);
+    const globalScore = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0) / scores.length) : 100;
+
+    await sb.upsert('progressions', {
+      username: session.username,
+      surah_id: surahId,
+      activities,
+      completed_at: new Date().toISOString(),
+      global_score: globalScore
+    }, 'username,surah_id');
+  } catch (e) { console.error('completeSurah error:', e); }
+}
+
+async function getProgress(username) {
+  const u = username || (getSession() || {}).username;
+  if (!u) return {};
+  try {
+    const rows = await sb.select('progressions', `?username=eq.${encodeURIComponent(u)}`);
+    const result = {};
+    rows.forEach(r => {
+      result[r.surah_id] = {
+        activities: r.activities || {},
+        completedAt: r.completed_at,
+        globalScore: r.global_score
+      };
+    });
+    return result;
+  } catch (e) { return {}; }
+}
+
+async function getAllProgress() {
+  try {
+    const rows = await sb.select('progressions', '?select=*');
+    const result = {};
+    rows.forEach(r => {
+      if (!result[r.username]) result[r.username] = {};
+      result[r.username][r.surah_id] = {
+        activities: r.activities || {},
+        completedAt: r.completed_at,
+        globalScore: r.global_score
+      };
+    });
+    return result;
+  } catch (e) { return {}; }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MESSAGES
+// ─────────────────────────────────────────────────────────────
+
+async function sendMessage(username, messageText) {
+  try {
+    await sb.insert('messages', {
+      username,
+      text: messageText,
+      date: new Date().toLocaleDateString('ar-EG')
+    });
+  } catch (e) { console.error('sendMessage error:', e); }
+}
+
+async function getMessages(username) {
+  try {
+    const rows = await sb.select('messages', `?username=eq.${encodeURIComponent(username)}&order=id.asc`);
+    return rows.map(r => ({ text: r.text, date: r.date, id: r.id }));
+  } catch (e) { return []; }
+}
+
+async function clearMessages(username) {
+  try {
+    await sb.delete('messages', `?username=eq.${encodeURIComponent(username)}`);
+  } catch (e) { console.error('clearMessages error:', e); }
+}
+
+async function deleteMessageByIndex(username, index) {
+  try {
+    const rows = await sb.select('messages', `?username=eq.${encodeURIComponent(username)}&order=id.asc`);
+    if (rows && rows[index]) {
+      await sb.delete('messages', `?id=eq.${rows[index].id}`);
+    }
+  } catch (e) { console.error('deleteMessageByIndex error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  HORAIRES
+// ─────────────────────────────────────────────────────────────
+
+async function setSchedule(username, scheduleText) {
+  try {
+    await sb.upsert('horaires', { username, schedule_text: scheduleText }, 'username');
+  } catch (e) { console.error('setSchedule error:', e); }
+}
+
+async function getSchedule(username) {
+  try {
+    const rows = await sb.select('horaires', `?username=eq.${encodeURIComponent(username)}`);
+    return (rows && rows.length > 0) ? rows[0].schedule_text : 'لم يتم تحديد أوقات الحصص بعد.';
+  } catch (e) { return 'لم يتم تحديد أوقات الحصص بعد.'; }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PROFILS ADMINISTRATIFS
+// ─────────────────────────────────────────────────────────────
+
+async function getProfile(username) {
+  try {
+    const rows = await sb.select('profils_admin', `?username=eq.${encodeURIComponent(username)}`);
+    if (rows && rows.length > 0) {
+      return {
+        cinProvided: rows[0].cin_provided,
+        birthCertProvided: rows[0].birth_cert_provided,
+        payments: rows[0].payments || []
+      };
+    }
+    return { cinProvided: false, birthCertProvided: false, payments: [] };
+  } catch (e) { return { cinProvided: false, birthCertProvided: false, payments: [] }; }
+}
+
+async function updateProfile(username, profileData) {
+  try {
+    await sb.upsert('profils_admin', {
+      username,
+      cin_provided: profileData.cinProvided,
+      birth_cert_provided: profileData.birthCertProvided,
+      payments: profileData.payments || []
+    }, 'username');
+  } catch (e) { console.error('updateProfile error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DEVOIRS
+// ─────────────────────────────────────────────────────────────
+
+async function ajouterDevoir(studentId, profName, surate, ayaDebut, ayaFin, dateLimite) {
+  const session = getSession();
+  try {
+    const devoir = {
+      id: Date.now().toString(),
+      student_id: studentId,
+      prof_id: session ? session.username : 'admin',
+      prof_name: profName,
+      surate,
+      aya_debut: ayaDebut,
+      aya_fin: ayaFin,
+      date_limite: dateLimite,
+      statut: 'en_attente'
+    };
+    await sb.insert('devoirs', devoir);
+    return { ok: true };
+  } catch (e) {
+    console.error('ajouterDevoir error:', e);
+    return { ok: false, error: e.message };
+  }
+}
+
+async function marquerDevoirTermine(studentId, devoirId) {
+  try {
+    await sb.update('devoirs', { statut: 'termine' }, `?id=eq.${encodeURIComponent(devoirId)}&student_id=eq.${encodeURIComponent(studentId)}`);
+    return { ok: true };
+  } catch (e) { return { ok: false }; }
+}
+
+async function getDevoirs() {
+  try {
+    const rows = await sb.select('devoirs', '?order=date_limite.asc');
+    const now = Date.now();
+    const uneHeureEnMs = 60 * 60 * 1000;
+    return rows.filter(d => {
+      const deadline = new Date(d.date_limite).getTime();
+      return now <= (deadline + uneHeureEnMs);
+    });
+  } catch (e) { return []; }
+}
+
+async function annulerDevoir(devoirId) {
+  try {
+    await sb.delete('devoirs', `?id=eq.${encodeURIComponent(devoirId)}`);
+  } catch (e) { console.error('annulerDevoir error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  VÉRIFICATION SUSPENSION EN TEMPS RÉEL
+// ─────────────────────────────────────────────────────────────
+(async () => {
+  const pageActuelle = window.location.pathname;
+  if (pageActuelle.includes('login.html') || pageActuelle.includes('admin.html')) return;
+
+  const session = _getSession();
+  if (!session || !session.username || session.role === 'prof') return;
+
+  try {
+    const rows = await sb.select('eleves', `?username=eq.${encodeURIComponent(session.username)}`);
+    if (rows && rows.length > 0 && rows[0].is_suspended) {
+      _clearSession();
+      alert('⚠️ حساب مغلق');
+      window.location.href = 'login.html';
+    }
+  } catch (e) { /* pas critique */ }
+})();
+
+// ─────────────────────────────────────────────────────────────
+//  API PUBLIQUE
+// ─────────────────────────────────────────────────────────────
+const Auth = {
+  // Élèves
+  register, login, logout, getSession, requireAuth,
+  getAllStudents, getAllUsers, deleteStudent, toggleSuspension,
+
+  // Progression
+  recordActivity, completeSurah, getProgress, getAllProgress,
+  markSurahCompleted: completeSurah,
+
+  // Messages
+  sendMessage, getMessages, clearMessages, deleteMessageByIndex,
+
+  // Horaires
+  setSchedule, getSchedule,
+
+  // Profils
+  getProfile, updateProfile,
+
+  // Professeurs
+  registerProf, loginProf, getProfs, saveProfs,
+
+  // Devoirs
+  ajouterDevoir, marquerDevoirTermine, getDevoirs, annulerDevoir
+};
